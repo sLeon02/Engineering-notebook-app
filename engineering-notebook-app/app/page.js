@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { supabase } from '../lib/supabaseClient';
 
 const PHOTO_BUCKET = 'notebook-photos';
@@ -16,6 +17,8 @@ function formatDateShort(iso) {
 }
 
 export default function Home() {
+  const router = useRouter();
+  const [session, setSession] = useState(undefined); // undefined = not checked yet, null = signed out
   const [project, setProject] = useState('');
   const [entries, setEntries] = useState([]);
   const [activeId, setActiveId] = useState(null);
@@ -27,11 +30,30 @@ export default function Home() {
 
   const active = entries.find((e) => e.id === activeId) || null;
 
-  const loadEntries = useCallback(async () => {
+  // Auth gate: check session on load, subscribe to changes, redirect if signed out.
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (session === null) router.push('/login');
+  }, [session, router]);
+
+  async function signOut() {
+    await supabase.auth.signOut();
+    router.push('/login');
+  }
+
+  const loadEntries = useCallback(async (userId) => {
     setLoading(true);
     const { data: entryRows, error } = await supabase
       .from('entries')
       .select('*')
+      .eq('owner_id', userId)
       .order('created_at', { ascending: false });
 
     if (error) {
@@ -40,7 +62,7 @@ export default function Home() {
       return;
     }
 
-    const { data: photoRows } = await supabase.from('photos').select('*');
+    const { data: photoRows } = await supabase.from('photos').select('*').eq('owner_id', userId);
 
     const withPhotos = (entryRows || []).map((e) => ({
       ...e,
@@ -48,24 +70,25 @@ export default function Home() {
     }));
 
     setEntries(withPhotos);
-    if (withPhotos.length && !activeId) setActiveId(withPhotos[0].id);
+    if (withPhotos.length) setActiveId((prev) => prev || withPhotos[0].id);
     setLoading(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    loadEntries();
+    if (!session) return;
+    loadEntries(session.user.id);
     if (typeof window !== 'undefined') {
       const saved = window.localStorage?.getItem?.('notebook-project-name');
       // localStorage is fine here since this is a real deployed site, not a claude.ai artifact
       if (saved) setProject(saved);
     }
-  }, [loadEntries]);
+  }, [session, loadEntries]);
 
   async function createEntry() {
     const { data, error } = await supabase
       .from('entries')
       .insert({
+        owner_id: session.user.id,
         project,
         title: '',
         entry_date: todayISO(),
@@ -118,6 +141,10 @@ export default function Home() {
         author: entry.author,
         notes: entry.notes,
         generated: entry.generated,
+        entered_by: entry.entered_by,
+        entered_on: entry.entered_on || null,
+        witness_by: entry.witness_by,
+        witness_on: entry.witness_on || null,
       })
       .eq('id', entry.id);
     setStatus(
@@ -129,7 +156,7 @@ export default function Home() {
 
   async function uploadPhotos(entry, files) {
     for (const file of Array.from(files)) {
-      const path = `${entry.id}/${Date.now()}-${file.name}`;
+      const path = `${session.user.id}/${entry.id}/${Date.now()}-${file.name}`;
       const { error: uploadError } = await supabase.storage
         .from(PHOTO_BUCKET)
         .upload(path, file, { upsert: false });
@@ -144,6 +171,7 @@ export default function Home() {
       const { data: photoRow, error: insertError } = await supabase
         .from('photos')
         .insert({
+          owner_id: session.user.id,
           entry_id: entry.id,
           storage_path: path,
           url: publicUrlData.publicUrl,
@@ -185,7 +213,10 @@ export default function Home() {
     try {
       const res = await fetch('/api/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
         body: JSON.stringify({
           project,
           title: entry.title,
@@ -229,7 +260,10 @@ export default function Home() {
     try {
       const res = await fetch('/api/export-pdf', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
         body: JSON.stringify({ project, entries }),
       });
       if (!res.ok) {
@@ -261,6 +295,17 @@ export default function Home() {
   }
 
   const pageNumber = active ? entries.length - entries.findIndex((e) => e.id === activeId) : 0;
+
+  if (session === undefined) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--blueprint-darker)', color: '#DCE6EF', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+        Loading…
+      </div>
+    );
+  }
+  if (session === null) {
+    return null; // redirect effect above will send us to /login
+  }
 
   return (
     <div className="app">
@@ -303,6 +348,28 @@ export default function Home() {
           <button className="export-btn" onClick={exportPdf} disabled={exportingPdf}>
             {exportingPdf ? 'Building PDF...' : 'Download Notebook PDF'}
           </button>
+          <div
+            style={{
+              marginTop: 14,
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: 10.5,
+              color: '#93A6B8',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+            }}
+          >
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {session.user.email}
+            </span>
+            <button
+              onClick={signOut}
+              style={{ background: 'none', border: 'none', color: '#93A6B8', textDecoration: 'underline', cursor: 'pointer', fontSize: 10.5, fontFamily: 'inherit', padding: 0, flexShrink: 0 }}
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       </div>
 
@@ -401,6 +468,48 @@ export default function Home() {
                         />
                       </div>
                     ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="field-row">
+                <label>Sign-off — printed onto every page of this entry in the PDF</label>
+                <div className="two-col">
+                  <div>
+                    <input
+                      type="text"
+                      placeholder="Entered by (name)"
+                      value={active.entered_by}
+                      onChange={(e) => updateLocal(active.id, { entered_by: e.target.value })}
+                      onBlur={(e) => persistField(active.id, 'entered_by', e.target.value)}
+                      style={{ marginBottom: 8 }}
+                    />
+                    <input
+                      type="date"
+                      value={active.entered_on || ''}
+                      onChange={(e) => {
+                        updateLocal(active.id, { entered_on: e.target.value });
+                        persistField(active.id, 'entered_on', e.target.value || null);
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <input
+                      type="text"
+                      placeholder="Witnessed & understood by (name)"
+                      value={active.witness_by}
+                      onChange={(e) => updateLocal(active.id, { witness_by: e.target.value })}
+                      onBlur={(e) => persistField(active.id, 'witness_by', e.target.value)}
+                      style={{ marginBottom: 8 }}
+                    />
+                    <input
+                      type="date"
+                      value={active.witness_on || ''}
+                      onChange={(e) => {
+                        updateLocal(active.id, { witness_on: e.target.value });
+                        persistField(active.id, 'witness_on', e.target.value || null);
+                      }}
+                    />
                   </div>
                 </div>
               </div>
