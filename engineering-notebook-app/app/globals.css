@@ -165,7 +165,7 @@ body{
 }
 .title-input:focus{ outline:none; border-bottom-color:var(--copper); }
 .two-col{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-input[type=date], input[type=text]{
+input[type=date], input[type=text], input[type=password]{
   font-family:'IBM Plex Mono',monospace; font-size:13px; padding:8px 10px; border:1px solid var(--grid-line-strong);
   border-radius:4px; background:rgba(255,255,255,0.6); color:var(--ink); width:100%;
 }
